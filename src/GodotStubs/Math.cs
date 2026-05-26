@@ -67,6 +67,7 @@ public struct Color
     public static Color Transparent { get; } = new(0, 0, 0, 0);
 
     public Color(float r, float g, float b, float a = 1f) { R = r; G = g; B = b; A = a; }
+    public Color(Color color, float alpha) { R = color.R; G = color.G; B = color.B; A = alpha; }
     public Color(string htmlColor) { R = 1; G = 1; B = 1; A = 1; }
 
     public Color Lerp(Color to, float weight) => new(

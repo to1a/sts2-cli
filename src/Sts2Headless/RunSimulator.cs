@@ -954,30 +954,29 @@ public class RunSimulator
 
         var card = hand[cardIndex];
 
-        // Determine target based on card's TargetType first
-        // Self/None/All cards: target = null (game handles internally)
-        // AnyEnemy cards: use target_index or auto-pick first alive enemy
+        // Determine target based on card's TargetType first.
+        // Self/None/All cards: target = null (game handles internally).
+        // AnyEnemy cards need an explicit target in multi-enemy combat; silently
+        // picking the first living enemy makes JSON actions ambiguous.
         Creature? target = null;
         var cardTargetType = card.TargetType;
         if (cardTargetType == TargetType.AnyEnemy)
         {
-            // Use caller's target_index if provided
-            if (args.TryGetValue("target_index", out var targetObj) && targetObj != null)
+            var state = CombatManager.Instance.DebugOnlyGetState();
+            var enemies = state?.Enemies?.Where(e => e != null && e.IsAlive).ToList() ?? new();
+            if (!args.TryGetValue("target_index", out var targetObj) || targetObj == null)
             {
-                var targetIndex = Convert.ToInt32(targetObj);
-                var state = CombatManager.Instance.DebugOnlyGetState();
-                if (state != null)
-                {
-                    var enemies = state.Enemies.Where(e => e != null && e.IsAlive).ToList();
-                    if (targetIndex >= 0 && targetIndex < enemies.Count)
-                        target = enemies[targetIndex];
-                }
+                if (enemies.Count > 1)
+                    return Error($"Card {card.GetType().Name} requires 'target_index' ({enemies.Count} enemies alive)");
+                target = enemies.FirstOrDefault();
             }
-            // Fallback: auto-target first alive enemy
-            if (target == null)
+
+            if (args.TryGetValue("target_index", out var targetObj2) && targetObj2 != null)
             {
-                var state = CombatManager.Instance.DebugOnlyGetState();
-                target = state?.Enemies?.FirstOrDefault(e => e != null && e.IsAlive);
+                var targetIndex = Convert.ToInt32(targetObj2);
+                if (targetIndex < 0 || targetIndex >= enemies.Count)
+                    return Error($"Invalid target_index {targetIndex}, {enemies.Count} enemies alive");
+                target = enemies[targetIndex];
             }
         }
         // All other target types (None, All, etc.) → leave target as null
@@ -1008,6 +1007,9 @@ public class RunSimulator
 
     private Dictionary<string, object?> DoEndTurn(Player player)
     {
+        if (_cardSelector.HasPending || _cardSelector.HasPendingReward || _pendingBundles != null)
+            return DetectDecisionPoint();
+
         if (!CombatManager.Instance.IsPlayPhase)
         {
             // Might be between phases — pump and check
@@ -1279,7 +1281,20 @@ public class RunSimulator
 
         try
         {
-            entry.OnTryPurchaseWrapper(merchantRoom.Inventory).GetAwaiter().GetResult();
+            var task = Task.Run(() => entry.OnTryPurchaseWrapper(merchantRoom.Inventory));
+            for (int i = 0; i < 100; i++)
+            {
+                _syncCtx.Pump();
+                if (_cardSelector.HasPending || _cardSelector.HasPendingReward || _pendingBundles != null) break;
+                if (task.IsCompleted) break;
+                Thread.Sleep(10);
+            }
+            if (_cardSelector.HasPending || _cardSelector.HasPendingReward || _pendingBundles != null)
+            {
+                WaitForActionExecutor();
+                return DetectDecisionPoint();
+            }
+            if (!task.IsCompleted) task.Wait(2000);
             _syncCtx.Pump();
             Log($"Bought relic: {entry.Model.GetType().Name} for {entry.Cost}g");
         }
@@ -1441,7 +1456,7 @@ public class RunSimulator
         var potion = potionsList[idx];
         if (potion == null) return Error($"No potion at index {idx}");
 
-        // Determine target based on potion's TargetType first, then fall back to target_index
+        // Determine target based on potion's TargetType first.
         Creature? target = null;
         var potionTargetType = potion.TargetType;
 
@@ -1453,22 +1468,21 @@ public class RunSimulator
         }
         else if (potionTargetType == TargetType.AnyEnemy)
         {
-            // Use caller's target_index if provided, otherwise pick first alive enemy
-            if (args.TryGetValue("target_index", out var tObj) && tObj != null)
+            var combatState = CombatManager.Instance.DebugOnlyGetState();
+            var enemies = combatState?.Enemies?.Where(e => e != null && e.IsAlive).ToList() ?? new();
+            if (!args.TryGetValue("target_index", out var tObj) || tObj == null)
             {
-                var targetIdx = Convert.ToInt32(tObj);
-                var combatState = CombatManager.Instance.DebugOnlyGetState();
-                if (combatState != null)
-                {
-                    var enemies = combatState.Enemies.Where(e => e != null && e.IsAlive).ToList();
-                    if (targetIdx >= 0 && targetIdx < enemies.Count)
-                        target = enemies[targetIdx];
-                }
+                if (enemies.Count > 1)
+                    return Error($"Potion {potion.GetType().Name} requires 'target_index' ({enemies.Count} enemies alive)");
+                target = enemies.FirstOrDefault();
             }
-            if (target == null && CombatManager.Instance.IsInProgress)
+
+            if (args.TryGetValue("target_index", out var tObj2) && tObj2 != null)
             {
-                var combatState = CombatManager.Instance.DebugOnlyGetState();
-                target = combatState?.Enemies?.FirstOrDefault(e => e != null && e.IsAlive);
+                var targetIdx = Convert.ToInt32(tObj2);
+                if (targetIdx < 0 || targetIdx >= enemies.Count)
+                    return Error($"Invalid target_index {targetIdx}, {enemies.Count} enemies alive");
+                target = enemies[targetIdx];
             }
         }
         // All other target types (None, All, etc.) → leave target as null
@@ -2058,8 +2072,14 @@ public class RunSimulator
                             {
                                 try
                                 {
-                                    intentInfo["damage"] = atk.GetTotalDamage(playerCreatures, e);
-                                    if (atk.Repeats > 1) intentInfo["hits"] = atk.Repeats;
+                                    var hits = Math.Max(1, atk.Repeats);
+                                    var totalDamage = atk.GetTotalDamage(playerCreatures, e);
+                                    intentInfo["damage"] = hits > 1 ? totalDamage / hits : totalDamage;
+                                    if (hits > 1)
+                                    {
+                                        intentInfo["hits"] = hits;
+                                        intentInfo["total_damage"] = totalDamage;
+                                    }
                                 }
                                 catch { }
                             }
@@ -2746,7 +2766,7 @@ public class RunSimulator
                 var dstats = new Dictionary<string, object?>();
                 try { foreach (var dv in c.DynamicVars.Values) dstats[dv.Name.ToLowerInvariant()] = (int)dv.BaseValue; } catch { }
                 var dkws = c.Keywords?.Where(k => k != CardKeyword.None).Select(k => k.ToString()).ToList();
-                return new Dictionary<string, object?>
+                var cardInfo = new Dictionary<string, object?>
                 {
                     ["id"] = c.Id.ToString(),
                     ["name"] = _loc.Card(c.Id.Entry),
@@ -2758,8 +2778,24 @@ public class RunSimulator
                     ["keywords"] = dkws?.Count > 0 ? dkws : null,
                     ["after_upgrade"] = GetUpgradedInfo(c),
                 };
+                AddCardModifierInfo(cardInfo, c);
+                return cardInfo;
             }).ToList(),
         };
+    }
+
+    private void AddCardModifierInfo(Dictionary<string, object?> cardInfo, CardModel card)
+    {
+        if (card.Enchantment != null)
+        {
+            cardInfo["enchantment"] = _loc.Bilingual("enchantments", card.Enchantment.Id.Entry + ".title");
+            try { if (card.Enchantment.Amount != 0) cardInfo["enchantment_amount"] = card.Enchantment.Amount; } catch { }
+        }
+        if (card.Affliction != null)
+        {
+            cardInfo["affliction"] = _loc.Bilingual("afflictions", card.Affliction.Id.Entry + ".title");
+            try { if (card.Affliction.Amount != 0) cardInfo["affliction_amount"] = card.Affliction.Amount; } catch { }
+        }
     }
 
     /// <summary>Common context added to every decision point.</summary>
@@ -2820,6 +2856,24 @@ public class RunSimulator
         // Initialize SaveManager with a dummy profile for save/load support
         try { SaveManager.Instance.InitProfileId(0); }
         catch (Exception ex) { Console.Error.WriteLine($"[WARN] SaveManager.InitProfileId: {ex.Message}"); }
+
+        // Some card animations/effects consult settings and prefs even in headless mode
+        // (for example Whirlwind checks PrefsSave.FastMode). Initialize them when the
+        // game DLL exposes test helpers, but keep this compatible with older DLLs.
+        foreach (var methodName in new[] { "InitSettingsDataForTest", "InitPrefsDataForTest" })
+        {
+            try
+            {
+                var method = SaveManager.Instance.GetType().GetMethod(
+                    methodName,
+                    BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                method?.Invoke(SaveManager.Instance, null);
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"[WARN] SaveManager.{methodName}: {ex.Message}");
+            }
+        }
 
         // Initialize progress data for epoch/timeline tracking
         try { SaveManager.Instance.InitProgressData(); }
